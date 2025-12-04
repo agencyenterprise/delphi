@@ -1,4 +1,4 @@
-neuronpedia_raw
+neuronpedia_cache
 .specstory/
 *.egg-info
 *__pycache__
