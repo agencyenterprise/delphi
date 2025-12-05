@@ -68,6 +68,7 @@ python score_generated_labels.py \
 - `--num-examples-per-prompt`: Number of examples per scorer prompt (default: 5)
 - `--batch-size`: Number of latents to process in parallel (default: 10)
 - `--max-latents`: Maximum number of latents to score, for testing (optional)
+- `--min-examples`: Minimum activating examples required per latent (default: 20)
 
 ## Output Format
 

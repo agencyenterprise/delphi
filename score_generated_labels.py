@@ -295,6 +295,12 @@ def main():
         default=None,
         help="Maximum number of latents to score (for testing)"
     )
+    parser.add_argument(
+        "--min-examples",
+        type=int,
+        default=20,
+        help="Minimum number of activating examples required per latent (default: 20, lower than generation since we're just scoring)"
+    )
     
     args = parser.parse_args()
     
@@ -314,6 +320,7 @@ def main():
     print(f"Max model length: {args.max_model_len}")
     print(f"Examples per prompt: {args.num_examples_per_prompt}")
     print(f"Batch size: {args.batch_size}")
+    print(f"Min examples per latent: {args.min_examples}")
     
     # Step 1: Load labels from JSON
     metadata, labels_by_latent = load_labels(args.labels_file)
@@ -363,7 +370,7 @@ def main():
     )
     
     constructor_cfg = ConstructorConfig(
-        min_examples=50,  # Lower threshold for neuronpedia data
+        min_examples=args.min_examples,  # Configurable threshold (default 20 for scoring)
         example_ctx_len=32,
         n_non_activating=50,
         non_activating_source="random",
