@@ -12,6 +12,7 @@ to avoid CUDA deadlock. See VLLM_CUDA_FIX.md for details.
 import argparse
 import asyncio
 import json
+import logging
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List
@@ -182,13 +183,14 @@ def compute_summary_statistics(all_results: List[Dict], metadata: Dict) -> Dict:
     }
 
 
-def load_latent_records(dataset: LatentDataset, latent_indices: set) -> Dict[int, Any]:
+def load_latent_records(dataset: LatentDataset, latent_indices: set, show_warnings: bool = False) -> Dict[int, Any]:
     """
     Load LatentRecords from dataset (must be called from sync context).
     
     Args:
         dataset: LatentDataset to load from
         latent_indices: Set of latent indices to load
+        show_warnings: Whether to show "not enough examples" warnings
     
     Returns:
         Dictionary mapping latent_index to LatentRecord
@@ -196,13 +198,30 @@ def load_latent_records(dataset: LatentDataset, latent_indices: set) -> Dict[int
     records_dict = {}
     print(f"Need to load {len(latent_indices)} unique latents")
     
-    with tqdm(total=len(latent_indices), desc="Loading records") as pbar:
+    # Temporarily suppress delphi INFO/WARNING messages if requested
+    if not show_warnings:
+        logging.getLogger('delphi.latents.constructors').setLevel(logging.ERROR)
+        logging.getLogger('delphi.latents.samplers').setLevel(logging.ERROR)
+    
+    total_processed = 0
+    with tqdm(total=len(latent_indices), desc="Loading records", 
+              bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]') as pbar:
         for record in dataset:
-            if record.latent.latent_index in latent_indices:
+            total_processed += 1
+            if record is not None and record.latent.latent_index in latent_indices:
                 records_dict[record.latent.latent_index] = record
                 pbar.update(1)
                 if len(records_dict) >= len(latent_indices):
                     break  # Found all records we need
+            
+            # Update status every 10 latents to show we're still working
+            if total_processed % 10 == 0:
+                pbar.set_postfix({'processed': total_processed, 'found': len(records_dict)}, refresh=True)
+    
+    # Restore logging
+    if not show_warnings:
+        logging.getLogger('delphi.latents.constructors').setLevel(logging.WARNING)
+        logging.getLogger('delphi.latents.samplers').setLevel(logging.INFO)
     
     return records_dict
 
@@ -300,6 +319,11 @@ def main():
         type=int,
         default=20,
         help="Minimum number of activating examples required per latent (default: 20, lower than generation since we're just scoring)"
+    )
+    parser.add_argument(
+        "--show-warnings",
+        action="store_true",
+        help="Show 'not enough examples' warnings during dataset loading (default: hide them for cleaner output)"
     )
     
     args = parser.parse_args()
@@ -421,9 +445,12 @@ def main():
     
     # Load all records (dataset is an iterator, can only iterate once)
     # Must be done in synchronous context to avoid event loop conflicts
-    records_dict = load_latent_records(dataset, all_latent_indices)
+    records_dict = load_latent_records(dataset, all_latent_indices, args.show_warnings)
     
+    skipped_count = len(all_latent_indices) - len(records_dict)
     print(f"✅ Loaded {len(records_dict)} LatentRecords")
+    if skipped_count > 0:
+        print(f"⚠️  Skipped {skipped_count} latents (not enough examples, min_examples={args.min_examples})")
     
     # Step 6: Score all labels in batches (async)
     print("\n" + "=" * 80)
