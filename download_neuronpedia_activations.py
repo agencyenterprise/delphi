@@ -4,11 +4,11 @@ Download and convert NeuronPedia activation data from S3 to Delphi format.
 
 Uses parallel processing for fast downloads and parsing.
 
-The script creates unique directories for each SAE:
+The script creates unique directories for each SAE using the same naming as the S3 bucket:
     Output:
-        19-llamascope-res-32k   → ./neuronpedia_activations/model.layers.19.res-32k/
-        20-llamascope-res-131k  → ./neuronpedia_activations/model.layers.20.res-131k/
-        27-llamascope-mlp-32k   → ./neuronpedia_activations/model.layers.27.mlp-32k/
+        19-llamascope-res-32k   → ./neuronpedia_activations/19-llamascope-res-32k/
+        20-llamascope-res-131k  → ./neuronpedia_activations/20-llamascope-res-131k/
+        27-llamascope-mlp-32k   → ./neuronpedia_activations/27-llamascope-mlp-32k/
     
     Cache:
         19-llamascope-res-32k   → ./neuronpedia_cache/19-llamascope-res-32k/
@@ -19,32 +19,32 @@ Usage:
     # Layer 19 residual SAE (32k features)
     python download_neuronpedia_activations.py \
         --model llama3.1-8b \
-        --layer 19-llamascope-res-32k \
+        --sae 19-llamascope-res-32k \
         --num-workers 8
     
     # Layer 20 residual SAE (131k features)
     python download_neuronpedia_activations.py \
         --model llama3.1-8b \
-        --layer 20-llamascope-res-131k \
+        --sae 20-llamascope-res-131k \
         --num-workers 8
     
     # Layer 27 MLP SAE (32k features)
     python download_neuronpedia_activations.py \
         --model llama3.1-8b \
-        --layer 27-llamascope-mlp-32k \
+        --sae 27-llamascope-mlp-32k \
         --num-workers 8
 """
 
 import argparse
 import gzip
 import json
+import urllib.error
 import urllib.request
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List
 
-import numpy as np
 import torch
 from safetensors.torch import save_file
 from tqdm import tqdm
@@ -56,15 +56,38 @@ def list_s3_batches(bucket: str, prefix: str) -> List[str]:
     List all batch files in the S3 bucket.
     
     For NeuronPedia, the URL pattern is:
-    https://neuronpedia-datasets.s3.us-east-1.amazonaws.com/v1/{model}/{layer}/activations/batch-{i}.jsonl.gz
+    https://neuronpedia-datasets.s3.us-east-1.amazonaws.com/v1/{model}/{sae}/activations/batch-{i}.jsonl.gz
+    
+    We probe sequentially starting from batch-0 until we get a 404.
     """
     base_url = f"https://{bucket}.s3.us-east-1.amazonaws.com/{prefix}"
     
-    # NeuronPedia typically has batches numbered 0-31 (32 batches total)
     batch_urls = []
-    for i in range(32):
-        url = f"{base_url}/batch-{i}.jsonl.gz"
-        batch_urls.append(url)
+    batch_idx = 0
+    
+    while True:
+        url = f"{base_url}/batch-{batch_idx}.jsonl.gz"
+        
+        # Check if the URL exists using a HEAD request
+        try:
+            req = urllib.request.Request(url, method='HEAD')
+            with urllib.request.urlopen(req, timeout=10) as response:
+                if response.status == 200:
+                    batch_urls.append(url)
+                    batch_idx += 1
+                else:
+                    break
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                # No more batches
+                break
+            else:
+                # Other error, re-raise
+                raise
+        except Exception as e:
+            # Network error or timeout - assume we're done
+            print(f"Warning: Error checking batch-{batch_idx}: {e}")
+            break
     
     return batch_urls
 
@@ -181,6 +204,7 @@ def merge_feature_data(
 def save_as_safetensors(
     feature_data: Dict[int, Dict[str, List]],
     output_dir: Path,
+    ctx_len: int,
     shard_size: int = 6553
 ):
     """
@@ -189,7 +213,8 @@ def save_as_safetensors(
     Args:
         feature_data: Dictionary of feature activations
         output_dir: Output directory
-        shard_size: Number of features per shard
+        ctx_len: Context length for padding
+        shard_size: Number of features per shard (default 6553 for ~5 shards with 32k features)
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     
@@ -249,7 +274,7 @@ def save_as_safetensors(
             
             tokens_tensor = torch.tensor(padded_tokens, dtype=torch.int64)
         else:
-            tokens_tensor = torch.zeros((0, 128), dtype=torch.int64)
+            tokens_tensor = torch.zeros((0, ctx_len), dtype=torch.int64)
         
         # Create tensors
         shard_data = {
@@ -264,10 +289,11 @@ def save_as_safetensors(
         print(f"Saved {output_file} with {len(all_activations)} activations")
 
 
-def save_config(output_dir: Path, model_name: str, ctx_len: int):
+def save_config(output_dir: Path, model_name: str, sae_name: str, ctx_len: int):
     """Save config.json for Delphi."""
     config = {
         "model_name": model_name,
+        "sae_name": sae_name,
         "ctx_len": ctx_len,
         "dataset_repo": "neuronpedia",
         "dataset_split": "activations",
@@ -291,9 +317,9 @@ def main():
         help="Model name in NeuronPedia (e.g., llama3.1-8b)"
     )
     parser.add_argument(
-        "--layer",
-        default="19-llamascope-res-32k",
-        help="Layer/SAE identifier (e.g., 19-llamascope-res-32k, 20-llamascope-res-131k, 27-llamascope-mlp-32k)"
+        "--sae",
+        required=True,
+        help="SAE identifier (e.g., 19-llamascope-res-32k, 20-llamascope-res-131k, 27-llamascope-mlp-32k)"
     )
     parser.add_argument(
         "--output-dir",
@@ -331,36 +357,21 @@ def main():
     
     args = parser.parse_args()
     
-    # Parse layer string to create a unique module name
-    # E.g., "20-llamascope-res-131k" -> "model.layers.20.res-131k"
-    # E.g., "27-llamascope-mlp-32k" -> "model.layers.27.mlp-32k"
-    parts = args.layer.split('-')
-    layer_num = parts[0]
-    
-    # Extract SAE type (everything after "llamascope-")
-    # "20-llamascope-res-131k" -> ["20", "llamascope", "res", "131k"]
-    if len(parts) >= 3 and parts[1] == "llamascope":
-        sae_type = '-'.join(parts[2:])  # "res-131k", "mlp-32k", etc.
-        module_name = f"model.layers.{layer_num}.{sae_type}"
-    else:
-        # Fallback for non-standard naming
-        module_name = f"model.layers.{layer_num}"
-    
-    # Setup paths - make cache SAE-specific too
-    output_dir = Path(args.output_dir) / module_name
-    cache_dir = Path(args.cache_dir) / args.layer  # Use full layer identifier for cache
+    # Setup paths using SAE name directly
+    output_dir = Path(args.output_dir) / args.sae
+    cache_dir = Path(args.cache_dir) / args.sae
     cache_dir.mkdir(parents=True, exist_ok=True)
     
     print(f"Model: {args.model}")
-    print(f"Layer/SAE: {args.layer}")
-    print(f"Module name: {module_name}")
+    print(f"SAE: {args.sae}")
     print(f"Cache directory: {cache_dir}")
     print(f"Output directory: {output_dir}")
     
     # List batches
     bucket = "neuronpedia-datasets"
-    prefix = f"v1/{args.model}/{args.layer}/activations"
+    prefix = f"v1/{args.model}/{args.sae}/activations"
     
+    print("Discovering available batches...")
     batch_urls = list_s3_batches(bucket, prefix)
     
     if args.max_batches:
@@ -442,10 +453,10 @@ def main():
     print("\n" + "=" * 80)
     print("STEP 3: Saving to safetensors format")
     print("=" * 80)
-    save_as_safetensors(all_feature_data, output_dir)
+    save_as_safetensors(all_feature_data, output_dir, args.ctx_len)
     
     # Save config
-    save_config(output_dir, args.tokenizer, args.ctx_len)
+    save_config(output_dir, args.tokenizer, args.sae, args.ctx_len)
     
     print("\n" + "=" * 80)
     print("✅ COMPLETE!")
