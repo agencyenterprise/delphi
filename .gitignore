@@ -1,3 +1,6 @@
+.specstory/
+neuronpedia_activations/
+neuronpedia_cache/
 *.egg-info
 *__pycache__
 *.pt
