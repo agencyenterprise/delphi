@@ -173,6 +173,7 @@ async def evaluate_labels(
     model: str,
     num_gpus: int,
     max_model_len: int,
+    min_examples: int,
 ) -> list[EvaluationResult]:
     """
     Evaluate all labels in parallel using vLLM batching.
@@ -184,6 +185,7 @@ async def evaluate_labels(
         model: Model name for LLM
         num_gpus: Number of GPUs to use
         max_model_len: Maximum model context length
+        min_examples: Minimum number of activating examples required
     
     Returns:
         List of evaluation results
@@ -240,7 +242,7 @@ async def evaluate_labels(
     )
     constructor_cfg = ConstructorConfig(
         example_ctx_len=ctx_len,  # Read from activation config
-        min_examples=50,
+        min_examples=min_examples,  # From command line arg
         n_non_activating=50,
         center_examples=True,
         non_activating_source="random",
@@ -269,8 +271,18 @@ async def evaluate_labels(
     print(f"  Building latent records dictionary...")
     latent_records_dict = {}
     filtered_count = 0
-    async for latent_record in dataset:
-        latent_records_dict[latent_record.latent.latent_index] = latent_record
+    
+    # Create progress bar for the async iteration
+    from tqdm.asyncio import tqdm as atqdm
+    
+    async def build_records_with_progress():
+        pbar = atqdm(total=len(unique_latent_indices), desc="  Processing latents")
+        async for latent_record in dataset:
+            latent_records_dict[latent_record.latent.latent_index] = latent_record
+            pbar.update(1)
+        pbar.close()
+    
+    await build_records_with_progress()
     
     filtered_count = len(unique_latent_indices) - len(latent_records_dict)
     if filtered_count > 0:
@@ -494,6 +506,12 @@ async def main():
         default=None,
         help="Maximum number of labels to evaluate (for testing, default: all)"
     )
+    parser.add_argument(
+        "--min-examples",
+        type=int,
+        default=50,
+        help="Minimum number of activating examples required (default: 50)"
+    )
     
     args = parser.parse_args()
     
@@ -505,6 +523,7 @@ async def main():
     print(f"Layer: {args.layer}")
     print(f"Model: {args.model}")
     print(f"GPUs: {args.num_gpus}")
+    print(f"Min examples: {args.min_examples}")
     
     # Load labels
     print("\nLoading labels...")
@@ -530,6 +549,7 @@ async def main():
         args.model,
         args.num_gpus,
         args.max_model_len,
+        args.min_examples,
     )
     
     # Print statistics
