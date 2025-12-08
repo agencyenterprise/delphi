@@ -225,20 +225,32 @@ async def score_task(
         # Extract scores
         scores: list[ClassifierOutput] = result.score
         
-        # Compute metrics
-        predictions = [s.prediction for s in scores if s.prediction is not None]
-        actuals = [s.activating for s in scores]
-        correct = [s.correct for s in scores if s.correct is not None]
+        # Separate valid scores from errored ones
+        # CRITICAL: Only use scores where prediction is not None
+        valid_scores = [s for s in scores if s.prediction is not None]
+        errored_scores = [s for s in scores if s.prediction is None]
         
-        tp = sum(1 for s in scores if s.activating and s.prediction)
-        fp = sum(1 for s in scores if not s.activating and s.prediction)
-        tn = sum(1 for s in scores if not s.activating and not s.prediction)
-        fn = sum(1 for s in scores if s.activating and not s.prediction)
+        total_scores = len(scores)
+        n_valid = len(valid_scores)
+        n_errored = len(errored_scores)
+        error_rate = n_errored / total_scores if total_scores > 0 else 0.0
         
-        accuracy = sum(correct) / len(correct) if correct else 0.0
-        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+        # Compute metrics ONLY on valid scores
+        if n_valid > 0:
+            tp = sum(1 for s in valid_scores if s.activating and s.prediction)
+            fp = sum(1 for s in valid_scores if not s.activating and s.prediction)
+            tn = sum(1 for s in valid_scores if not s.activating and not s.prediction)
+            fn = sum(1 for s in valid_scores if s.activating and not s.prediction)
+            
+            correct = sum(1 for s in valid_scores if s.correct)
+            accuracy = correct / n_valid
+            precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+        else:
+            # All predictions errored - no valid metrics
+            tp = fp = tn = fn = 0
+            accuracy = precision = recall = f1 = 0.0
         
         # Build result dictionary
         return {
@@ -255,6 +267,9 @@ async def score_task(
                 "fp": fp,
                 "tn": tn,
                 "fn": fn,
+                "n_valid": n_valid,
+                "n_errored": n_errored,
+                "error_rate": error_rate,
             },
             "per_example_scores": [
                 {
@@ -370,9 +385,21 @@ def compute_summary_statistics(results: list[dict[str, Any]]) -> dict[str, Any]:
     # Overall statistics
     all_metrics = [r["metrics"] for r in results]
     
+    # Calculate error statistics
+    total_valid = sum(m["n_valid"] for m in all_metrics)
+    total_errored = sum(m["n_errored"] for m in all_metrics)
+    total_predictions = total_valid + total_errored
+    overall_error_rate = total_errored / total_predictions if total_predictions > 0 else 0.0
+    
     summary = {
         "total_labels": len(results),
         "unique_latents": len(set(r["latent_index"] for r in results)),
+        "error_statistics": {
+            "total_predictions": total_predictions,
+            "total_valid": total_valid,
+            "total_errored": total_errored,
+            "error_rate": overall_error_rate,
+        },
         "overall": {
             "mean_f1": np.mean([m["f1"] for m in all_metrics]),
             "std_f1": np.std([m["f1"] for m in all_metrics]),
@@ -589,6 +616,14 @@ async def main():
     print(f"{'='*80}")
     print(f"Total labels scored: {summary['total_labels']}")
     print(f"Unique latents: {summary['unique_latents']}")
+    
+    # Print error statistics
+    err_stats = summary['error_statistics']
+    print(f"\nError Statistics:")
+    print(f"  Total predictions: {err_stats['total_predictions']}")
+    print(f"  Valid predictions: {err_stats['total_valid']} ({err_stats['total_valid']*100/err_stats['total_predictions']:.1f}%)")
+    print(f"  Errored predictions: {err_stats['total_errored']} ({err_stats['error_rate']*100:.1f}%)")
+    
     print(f"\nOverall Performance:")
     print(f"  Mean F1:        {summary['overall']['mean_f1']:.4f} ± {summary['overall']['std_f1']:.4f}")
     print(f"  Mean Accuracy:  {summary['overall']['mean_accuracy']:.4f} ± {summary['overall']['std_accuracy']:.4f}")
