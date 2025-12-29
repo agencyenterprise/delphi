@@ -77,6 +77,31 @@ class Offline(Client):
             self.statistics_path = Path("statistics")
             self.statistics_path.mkdir(parents=True, exist_ok=True)
 
+    def _convert_system_to_user(self, messages: list[dict[str, str]]) -> list[dict[str, str]]:
+        """
+        Convert system messages to user messages for models that don't support system role.
+        Merges system message into the first user message.
+        """
+        if not messages or messages[0].get("role") != "system":
+            return messages
+        
+        converted = []
+        system_content = messages[0]["content"]
+        
+        # Find the first user message and merge system content into it
+        found_user = False
+        for i, msg in enumerate(messages[1:], start=1):
+            if msg.get("role") == "user" and not found_user:
+                converted.append({
+                    "role": "user",
+                    "content": f"{system_content}\n\n{msg['content']}"
+                })
+                found_user = True
+            else:
+                converted.append(msg)
+        
+        return converted
+
     async def process_func(
         self,
         batches: Union[str, list[Union[dict[str, str], list[dict[str, str]]]]],
@@ -99,8 +124,15 @@ class Offline(Client):
         loop = asyncio.get_running_loop()
         prompts = []
         statistics = []
+        
+        # Check if model is Gemma (doesn't support system role)
+        is_gemma = "gemma" in self.model.lower()
 
         for batch in batches:
+            # Convert system messages to user messages for Gemma models
+            if is_gemma and isinstance(batch, list):
+                batch = self._convert_system_to_user(batch)
+            
             prompt = self.tokenizer.apply_chat_template(
                 batch, add_generation_prompt=True, tokenize=True
             )

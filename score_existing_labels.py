@@ -13,7 +13,8 @@ Usage:
         --activations neuronpedia_activations \\
         --module 19-llamascope-res-32k \\
         --scorer detection \\
-        --output results/baseline_detection
+        --output results/baseline_detection \\
+        --split val  # Optional: filter to specific split (e.g., train, val)
 """
 
 import argparse
@@ -51,32 +52,60 @@ class ScoringTask:
     label_info: LabelInfo
 
 
-def load_labels(label_file: Path) -> list[LabelInfo]:
+def load_labels(label_file: Path, split: Optional[str] = None) -> list[LabelInfo]:
     """
     Load labels from JSON file.
     
     Handles both formats:
     - Baseline: {"generated_labels": [{"latent_index": 21, "label": "..."}]}
     - Experimental: {"generated_labels": [{"latent_index": 21, "label": "...", "scale": 2.0, "label_index": 0}]}
+    - Gemmascope: [{"metadata": {...}, "vectors": [{"index": 0, "labels": [...], "split": "train"}]}]
+    
+    Args:
+        label_file: Path to the labels JSON file
+        split: Optional split to filter by (e.g., "train", "val"). If None, loads all splits.
     """
     with open(label_file) as f:
         data = json.load(f)
     
     labels = []
-    for entry in data["generated_labels"]:
-        labels.append(LabelInfo(
-            latent_index=entry["latent_index"],
-            label=entry["label"],
-            scale=entry.get("scale"),
-            label_index=entry.get("label_index")
-        ))
+    # Handle different JSON formats
+    if isinstance(data, list):
+        # Format: [{"metadata": {...}, "vectors": [{"index": 0, "labels": [...], "split": "train"}]}]
+        for item in data:
+            if "vectors" in item:
+                for vector in item["vectors"]:
+                    # Filter by split if specified
+                    vector_split = vector.get("split")
+                    if split is not None and vector_split != split:
+                        continue
+                    
+                    latent_index = vector["index"]
+                    for label_index, label in enumerate(vector["labels"]):
+                        labels.append(LabelInfo(
+                            latent_index=latent_index,
+                            label=label,
+                            scale=None,
+                            label_index=label_index
+                        ))
+    elif "generated_labels" in data:
+        # Format: {"generated_labels": [{"latent_index": 21, "label": "..."}]}
+        for entry in data["generated_labels"]:
+            labels.append(LabelInfo(
+                latent_index=entry["latent_index"],
+                label=entry["label"],
+                scale=entry.get("scale"),
+                label_index=entry.get("label_index")
+            ))
     
     print(f"✓ Loaded {len(labels)} labels from {label_file}")
+    if split is not None:
+        print(f"  - Filtered to split: {split}")
     
     # Print summary
     unique_latents = len(set(l.latent_index for l in labels))
     print(f"  - {unique_latents} unique latents")
-    if labels[0].scale is not None:
+    if labels and labels[0].scale is not None:
         scales = set(l.scale for l in labels)
         print(f"  - {len(scales)} scale values: {sorted(scales)}")
     
@@ -501,6 +530,12 @@ async def main():
         default=None,
         help="Max number of unique latents to test (tests all labels/scales for selected latents)"
     )
+    parser.add_argument(
+        "--split",
+        type=str,
+        default=None,
+        help="Optional split to filter by (e.g., 'train', 'val'). If not specified, loads all splits."
+    )
     
     args = parser.parse_args()
     
@@ -508,6 +543,8 @@ async def main():
     print("Label Scoring Pipeline")
     print("="*80)
     print(f"Labels: {args.labels}")
+    if args.split:
+        print(f"Split: {args.split}")
     print(f"Activations: {args.activations}")
     print(f"Module: {args.module}")
     print(f"Scorer: {args.scorer}")
@@ -519,7 +556,7 @@ async def main():
     args.output.mkdir(parents=True, exist_ok=True)
     
     # Load labels
-    labels = load_labels(args.labels)
+    labels = load_labels(label_file=args.labels, split=args.split)
     
     # Filter to max_latents if specified
     if args.max_latents is not None:

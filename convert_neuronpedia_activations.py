@@ -6,8 +6,14 @@ This script downloads activation data from NeuronPedia's S3 bucket and converts
 it to the format expected by delphi's LatentDataset, following the critical
 requirement that every shard must contain the SAME complete token dataset.
 
+Requirements for Gemma models:
+    - Gemma tokenizers require HuggingFace authentication
+    - Accept terms at: https://huggingface.co/google/gemma-2-9b
+    - Login: huggingface-cli login (or: hf auth login)
+
 Usage:
     python convert_neuronpedia_activations.py --model llama3.1-8b --layer 19-llamascope-res-32k
+    python convert_neuronpedia_activations.py --model gemma-2-9b --layer 20-gemmascope-res-131k
 """
 
 import argparse
@@ -25,6 +31,14 @@ import torch
 from safetensors.numpy import save_file
 from tqdm import tqdm
 from transformers import AutoTokenizer
+
+
+# Model ID to tokenizer mapping
+MODEL_TOKENIZERS = {
+    "llama3.1-8b": "meta-llama/Llama-3.1-8B",
+    "gemma-2-9b": "google/gemma-2-9b",
+    "gemma-2-9b-it": "google/gemma-2-9b-it",
+}
 
 
 def download_s3_files(
@@ -197,7 +211,23 @@ def load_neuronpedia_data(
     
     # Load tokenizer
     print(f"Loading tokenizer: {tokenizer_name}")
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+    except Exception as e:
+        error_msg = str(e)
+        if "gated" in error_msg.lower() or "401" in error_msg:
+            print("\n" + "="*80)
+            print("ERROR: Tokenizer requires HuggingFace authentication")
+            print("="*80)
+            print(f"The tokenizer '{tokenizer_name}' is from a gated repository.")
+            print("\nTo fix this:")
+            print("  1. Accept terms at: https://huggingface.co/{tokenizer_name}")
+            print("  2. Get your HF token: https://huggingface.co/settings/tokens")
+            print("  3. Login: huggingface-cli login")
+            print("     (or use: hf auth login)")
+            print("="*80)
+            raise RuntimeError(f"Authentication required for {tokenizer_name}") from e
+        raise
     
     # Process batch files in parallel
     print("\nFirst pass: Collecting all token sequences (parallel)...")
@@ -505,7 +535,7 @@ def main():
         "--model",
         type=str,
         default="llama3.1-8b",
-        help="Model identifier (default: llama3.1-8b)"
+        help="Model identifier. Supported: llama3.1-8b, gemma-2-9b, gemma-2-9b-it (default: llama3.1-8b)"
     )
     parser.add_argument(
         "--layer",
@@ -573,9 +603,17 @@ def main():
     if not batch_files:
         raise RuntimeError("No batch files available")
     
+    # Get tokenizer for this model
+    tokenizer_name = MODEL_TOKENIZERS.get(args.model)
+    if tokenizer_name is None:
+        raise ValueError(
+            f"Unknown model '{args.model}'. Supported models: {list(MODEL_TOKENIZERS.keys())}"
+        )
+    
     # Load data and build global token dataset
     global_tokens, feature_data, global_seq_mapping = load_neuronpedia_data(
-        batch_files,
+        batch_files=batch_files,
+        tokenizer_name=tokenizer_name,
         num_workers=args.num_workers
     )
     
