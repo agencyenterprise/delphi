@@ -122,6 +122,11 @@ def create_latent_dataset(
     Create a LatentDataset that only loads the specified latent indices.
     
     This is much more efficient than loading all latents when we only need a subset.
+    
+    CRITICAL: tokenizer_name MUST match the tokenizer used to generate the activation data!
+    - For NeuronPedia Gemma activations: use "google/gemma-2-9b"
+    - For NeuronPedia Llama activations: use "meta-llama/Llama-3.1-8B"
+    Using the wrong tokenizer will produce gibberish text.
     """
     print(f"\n{'='*80}")
     print(f"Initializing LatentDataset")
@@ -235,6 +240,8 @@ async def score_task(
     task: ScoringTask,
     scorer: DetectionScorer,
     semaphore: asyncio.Semaphore,
+    debug: bool = False,
+    debug_output_dir: Optional[Path] = None,
 ) -> dict[str, Any]:
     """
     Score a single task (LatentRecord with a label).
@@ -281,6 +288,70 @@ async def score_task(
             tp = fp = tn = fn = 0
             accuracy = precision = recall = f1 = 0.0
         
+        # Debug logging if enabled
+        if debug and f1 < 0.5:  # Log cases with poor F1
+            # Get sample predictions from valid scores - use str_tokens from ClassifierOutput
+            sample_predictions = []
+            for i, s in enumerate(valid_scores[:10]):  # First 10 valid predictions
+                # Extract text from str_tokens in the ClassifierOutput
+                text = "".join(s.str_tokens) if hasattr(s, 'str_tokens') and s.str_tokens else "N/A"
+                
+                sample_predictions.append({
+                    "activating": s.activating,
+                    "predicted": s.prediction,
+                    "correct": s.correct,
+                    "probability": s.probability,
+                    "text_snippet": text[:150]  # Show more text for better context
+                })
+            
+            debug_info = {
+                "latent_index": task.label_info.latent_index,
+                "label": task.label_info.label,
+                "scale": task.label_info.scale,
+                "f1": f1,
+                "tp": tp, "fp": fp, "tn": tn, "fn": fn,
+                "n_train": len(task.record.train),
+                "n_test": len(task.record.test),
+                "n_not_active": len(task.record.not_active),
+                "predictions_summary": {
+                    "activating_correct": tp,
+                    "activating_wrong": fn,
+                    "non_activating_correct": tn,
+                    "non_activating_wrong": fp,
+                },
+                "example_predictions": sample_predictions
+            }
+            
+            if debug_output_dir:
+                debug_file = debug_output_dir / f"debug_latent_{task.label_info.latent_index}_f1_{f1:.3f}.json"
+                with open(debug_file, 'w') as f:
+                    json.dump(debug_info, f, indent=2)
+            
+            # Print to console
+            print(f"\n{'='*80}")
+            print(f"DEBUG: Low F1 score ({f1:.3f}) for latent {task.label_info.latent_index}")
+            print(f"{'='*80}")
+            print(f"Label: {task.label_info.label}")
+            print(f"Scale: {task.label_info.scale}")
+            print(f"Confusion Matrix: TP={tp}, FP={fp}, TN={tn}, FN={fn}")
+            print(f"Dataset: {len(task.record.train)} train, {len(task.record.test)} test, {len(task.record.not_active)} not_active")
+            print(f"\nPrediction summary:")
+            print(f"  - Model correctly identified {tp} activating examples (should be high)")
+            print(f"  - Model incorrectly missed {fn} activating examples (should be low)")
+            print(f"  - Model correctly rejected {tn} non-activating examples (should be high)")
+            print(f"  - Model incorrectly flagged {fp} non-activating examples (should be low)")
+            print(f"\nSample predictions (first 10):")
+            for i, ex_pred in enumerate(sample_predictions[:10]):
+                status = "✓" if ex_pred["correct"] else "✗"
+                ex_type = "ACTIVATING" if ex_pred["activating"] else "NOT_ACTIVE"
+                pred = "YES" if ex_pred["predicted"] else "NO"
+                prob = ex_pred.get('probability', 'N/A')
+                prob_str = f"{prob:.3f}" if isinstance(prob, float) else str(prob)
+                text_snippet = ex_pred.get('text_snippet', 'N/A')
+                print(f"  {i+1:2d}. {status} {ex_type:12s} | Pred: {pred:3s} | Prob: {prob_str:5s}")
+                print(f"      Text: {text_snippet}")
+            print(f"{'='*80}\n")
+        
         # Build result dictionary
         return {
             "latent_index": task.label_info.latent_index,
@@ -325,6 +396,8 @@ async def run_scoring_pipeline(
     loader: LabelScoringLoader,
     scorer: DetectionScorer,
     max_concurrent: int = 10,
+    debug: bool = False,
+    debug_output_dir: Optional[Path] = None,
 ) -> list[dict[str, Any]]:
     """
     Run the scoring pipeline with simple progress tracking.
@@ -343,7 +416,7 @@ async def run_scoring_pipeline(
     
     async def process_and_update(task: ScoringTask):
         nonlocal scored
-        result = await score_task(task, scorer, semaphore)
+        result = await score_task(task, scorer, semaphore, debug=debug, debug_output_dir=debug_output_dir)
         
         async with update_lock:
             scored += 1
@@ -536,6 +609,11 @@ async def main():
         default=None,
         help="Optional split to filter by (e.g., 'train', 'val'). If not specified, loads all splits."
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug mode with detailed logging for low-scoring labels"
+    )
     
     args = parser.parse_args()
     
@@ -608,24 +686,49 @@ async def main():
     
     print("✓ Scorer initialized")
     
+    # Determine the correct tokenizer for the dataset based on the model
+    # The dataset needs to use the SAME tokenizer that was used to create the activations
+    # For Gemma models (google/gemma-*), use google/gemma-2-9b
+    # For Llama models (meta-llama/*), use meta-llama/Llama-3.1-8B
+    if "gemma" in args.model.lower():
+        # Use base Gemma tokenizer (not -it variant) to match activation data
+        dataset_tokenizer = "google/gemma-2-9b"
+    elif "llama" in args.model.lower():
+        dataset_tokenizer = "meta-llama/Llama-3.1-8B"
+    else:
+        # Default to the model itself
+        dataset_tokenizer = args.model
+    
+    print(f"Dataset tokenizer: {dataset_tokenizer} (must match the tokenizer used for activation generation)")
+    
     # Now safe to create dataset (which initializes CUDA/PyTorch)
     dataset = create_latent_dataset(
         args.activations,
         args.module,
-        latent_indices
+        latent_indices,
+        tokenizer_name=dataset_tokenizer
     )
     
     # Create loader
     loader = LabelScoringLoader(dataset, labels)
+    
+    # Setup debug output directory if needed
+    debug_output_dir = None
+    if args.debug:
+        debug_output_dir = args.output / "debug"
+        debug_output_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Debug mode enabled - detailed logs will be saved to: {debug_output_dir}")
     
     # Run pipeline
     print(f"\n{'='*80}")
     print(f"Running Scoring Pipeline")
     print(f"{'='*80}")
     print(f"Max concurrent: {args.max_concurrent}")
+    if args.debug:
+        print(f"Debug: ENABLED")
     print()
     
-    results = await run_scoring_pipeline(loader, scorer, args.max_concurrent)
+    results = await run_scoring_pipeline(loader, scorer, args.max_concurrent, debug=args.debug, debug_output_dir=debug_output_dir)
     
     # Compute summary statistics
     print(f"\n{'='*80}")
