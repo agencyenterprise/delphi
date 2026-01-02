@@ -187,3 +187,4 @@ statistics/
 .embedding_cache/
 wandb/
 uv.lock
+.hf_cache/
